@@ -107,7 +107,7 @@ func (c *Celeritas) Init(p initPaths) error {
 }
 
 func (c *Celeritas) checkDotEnv(path string) error {
-	err := c.CreateFileIfNotExist(fmt.Sprint("%s/.env", path))
+	err := c.CreateFileIfNotExist(fmt.Sprintf("%s/.env", path))
 	if err != nil {
 		return nil
 	}
