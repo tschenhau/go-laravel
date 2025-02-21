@@ -9,13 +9,17 @@ import (
 	"time"
 
 	"github.com/CloudyKit/jet/v6"
+	"github.com/alexedwards/scs/v2"
 	"github.com/go-chi/chi/v5"
 	"github.com/joho/godotenv"
 	"github.com/tschenhau/celeritas/render"
+	"github.com/tschenhau/celeritas/session"
 )
 
 const version = "1.0.0"
 
+// Celeritas is the overall type for the Celeritas package. Members that are exported in this type
+// are available to any application that uses it.
 type Celeritas struct {
 	AppName  string
 	Debug    bool
@@ -25,15 +29,20 @@ type Celeritas struct {
 	RootPath string
 	Routes   *chi.Mux
 	Render   *render.Render
+	Session  *scs.SessionManager
 	JetViews *jet.Set
 	config   config
 }
 
 type config struct {
-	port     string
-	renderer string
+	port        string
+	renderer    string
+	cookie      cookieConfig
+	sessionType string
 }
 
+// New reads the .env file, creates our application config, populates the Celeritas type with settings
+// based on .env values, and creates necessary folders and files if they don't exist
 func (c *Celeritas) New(rootPath string) error {
 	pathConfig := initPaths{
 		rootPath:    rootPath,
@@ -44,17 +53,19 @@ func (c *Celeritas) New(rootPath string) error {
 	if err != nil {
 		return err
 	}
+
 	err = c.checkDotEnv(rootPath)
 	if err != nil {
-		return nil
+		return err
 	}
+
 	// read .env
 	err = godotenv.Load(rootPath + "/.env")
 	if err != nil {
-		return nil
+		return err
 	}
 
-	//creat logger
+	// create loggers
 	infoLog, errorLog := c.startLoggers()
 	c.InfoLog = infoLog
 	c.ErrorLog = errorLog
@@ -62,10 +73,31 @@ func (c *Celeritas) New(rootPath string) error {
 	c.Version = version
 	c.RootPath = rootPath
 	c.Routes = c.routes().(*chi.Mux)
+
 	c.config = config{
 		port:     os.Getenv("PORT"),
 		renderer: os.Getenv("RENDERER"),
+		cookie: cookieConfig{
+			name:     os.Getenv("COOKIE_NAME"),
+			lifetime: os.Getenv("COOKIE_LIFETIME"),
+			persist:  os.Getenv("COOKIE_PERSISTS"),
+			secure:   os.Getenv("COOKIE_SECURE"),
+			domain:   os.Getenv("COOKIE_DOMAIN"),
+		},
+		sessionType: os.Getenv("SESSION_TYPE"),
 	}
+
+	// create session
+
+	sess := session.Session{
+		CookieLifetime: c.config.cookie.lifetime,
+		CookiePersist:  c.config.cookie.persist,
+		CookieName:     c.config.cookie.name,
+		SessionType:    c.config.sessionType,
+		CookieDomain:   c.config.cookie.domain,
+	}
+
+	c.Session = sess.InitSession()
 
 	var views = jet.NewSet(
 		jet.NewOSFileSystemLoader(fmt.Sprintf("%s/views", rootPath)),
@@ -79,6 +111,19 @@ func (c *Celeritas) New(rootPath string) error {
 	return nil
 }
 
+// Init creates necessary folders for our Celeritas application
+func (c *Celeritas) Init(p initPaths) error {
+	root := p.rootPath
+	for _, path := range p.folderNames {
+		// create folder if it doesn't exist
+		err := c.CreateDirIfNotExist(root + "/" + path)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ListenAndServe starts the web server
 func (c *Celeritas) ListenAndServe() {
 	srv := &http.Server{
@@ -89,27 +134,16 @@ func (c *Celeritas) ListenAndServe() {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 600 * time.Second,
 	}
-	c.InfoLog.Printf("Listening on port%s", os.Getenv("PORT"))
+
+	c.InfoLog.Printf("Listening on port %s", os.Getenv("PORT"))
 	err := srv.ListenAndServe()
 	c.ErrorLog.Fatal(err)
 }
 
-func (c *Celeritas) Init(p initPaths) error {
-	root := p.rootPath
-	for _, path := range p.folderNames {
-		//create a folder if it does not exist
-		err := c.CreateDirIfNotExist(root + "/" + path)
-		if err != nil {
-			return nil
-		}
-	}
-	return nil
-}
-
 func (c *Celeritas) checkDotEnv(path string) error {
-	err := c.CreateFileIfNotExist(fmt.Sprint("%s/.env", path))
+	err := c.CreateFileIfNotExists(fmt.Sprintf("%s/.env", path))
 	if err != nil {
-		return nil
+		return err
 	}
 	return nil
 }
@@ -131,6 +165,5 @@ func (c *Celeritas) createRenderer() {
 		Port:     c.config.port,
 		JetViews: c.JetViews,
 	}
-
 	c.Render = &myRenderer
 }

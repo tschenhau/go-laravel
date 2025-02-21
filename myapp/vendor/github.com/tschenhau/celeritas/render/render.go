@@ -1,11 +1,12 @@
 package render
 
 import (
+	"errors"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"strings"
-	"text/template"
 
 	"github.com/CloudyKit/jet/v6"
 )
@@ -37,8 +38,10 @@ func (c *Render) Page(w http.ResponseWriter, r *http.Request, view string, varia
 		return c.GoPage(w, r, view, data)
 	case "jet":
 		return c.JetPage(w, r, view, variables, data)
+	default:
+
 	}
-	return nil
+	return errors.New("no rendering engine specified")
 }
 
 // GoPage renders a standard Go template
@@ -61,7 +64,7 @@ func (c *Render) GoPage(w http.ResponseWriter, r *http.Request, view string, dat
 	return nil
 }
 
-// JetPage renders a template using the jet template engine
+// JetPage renders a template using the Jet templating engine
 func (c *Render) JetPage(w http.ResponseWriter, r *http.Request, templateName string, variables, data interface{}) error {
 	var vars jet.VarMap
 
