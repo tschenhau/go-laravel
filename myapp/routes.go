@@ -7,20 +7,65 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/tschenhau/celeritas/mailer"
 )
 
 func (a *application) routes() *chi.Mux {
 	// middleware must come before any routes
+	a.use(a.Middleware.CheckRemember)
 
 	// add routes here
-	a.App.Routes.Get("/", a.Handlers.Home)
+	a.get("/", a.Handlers.Home)
 	a.App.Routes.Get("/go-page", a.Handlers.GoPage)
 	a.App.Routes.Get("/jet-page", a.Handlers.JetPage)
 	a.App.Routes.Get("/sessions", a.Handlers.SessionTest)
 
 	a.App.Routes.Get("/users/login", a.Handlers.UserLogin)
-	a.App.Routes.Post("/users/login", a.Handlers.PostUserLogin)
+	a.post("/users/login", a.Handlers.PostUserLogin)
 	a.App.Routes.Get("/users/logout", a.Handlers.Logout)
+	a.get("/users/forgot-password", a.Handlers.Forgot)
+	a.post("/users/forgot-password", a.Handlers.PostForgot)
+	a.get("/users/reset-password", a.Handlers.ResetPasswordForm)
+	a.post("/users/reset-password", a.Handlers.PostResetPassword)
+
+	a.App.Routes.Get("/form", a.Handlers.Form)
+	a.App.Routes.Post("/form", a.Handlers.PostForm)
+
+	a.get("/json", a.Handlers.JSON)
+	a.get("/xml", a.Handlers.XML)
+	a.get("/download-file", a.Handlers.DownloadFile)
+
+	a.get("/crypto", a.Handlers.TestCrypto)
+
+	a.get("/cache-test", a.Handlers.ShowCachePage)
+	a.post("/api/save-in-cache", a.Handlers.SaveInCache)
+	a.post("/api/get-from-cache", a.Handlers.GetFromCache)
+	a.post("/api/delete-from-cache", a.Handlers.DeleteFromCache)
+	a.post("/api/empty-cache", a.Handlers.EmptyCache)
+
+	a.get("/test-mail", func(w http.ResponseWriter, r *http.Request) {
+		msg := mailer.Message{
+			From:        "info@verilion.com",
+			To:          "trevor.sawler@gmail.com",
+			Subject:     "Test Subject - sent using an API",
+			Template:    "test",
+			Attachments: nil,
+			Data:        nil,
+		}
+
+		a.App.Mail.Jobs <- msg
+		res := <-a.App.Mail.Results
+		if res.Error != nil {
+			a.App.ErrorLog.Println(res.Error)
+		}
+		// err := a.App.Mail.SendSMTPMessage(msg)
+		// if err != nil {
+		// 	a.App.ErrorLog.Println(err)
+		// 	return
+		// }
+
+		fmt.Fprint(w, "Send mail!")
+	})
 
 	a.App.Routes.Get("/create-user", func(w http.ResponseWriter, r *http.Request) {
 		u := data.User{
@@ -72,6 +117,16 @@ func (a *application) routes() *chi.Mux {
 		}
 
 		u.LastName = a.App.RandomString(10)
+
+		validator := a.App.Validator(nil)
+		u.LastName = ""
+
+		u.Validate(validator)
+
+		if !validator.Valid() {
+			fmt.Fprint(w, "failed validation")
+			return
+		}
 		err = u.Update(*u)
 		if err != nil {
 			a.App.ErrorLog.Println(err)

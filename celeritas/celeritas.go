@@ -6,33 +6,56 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/CloudyKit/jet/v6"
 	"github.com/alexedwards/scs/v2"
+	"github.com/dgraph-io/badger/v3"
 	"github.com/go-chi/chi/v5"
+	"github.com/gomodule/redigo/redis"
 	"github.com/joho/godotenv"
+	"github.com/robfig/cron/v3"
+	"github.com/tschenhau/celeritas/cache"
+	"github.com/tschenhau/celeritas/mailer"
 	"github.com/tschenhau/celeritas/render"
 	"github.com/tschenhau/celeritas/session"
 )
 
 const version = "1.0.0"
 
+var myRedisCache *cache.RedisCache
+var myBadgerCache *cache.BadgerCache
+var redisPool *redis.Pool
+var badgerConn *badger.DB
+
 // Celeritas is the overall type for the Celeritas package. Members that are exported in this type
 // are available to any application that uses it.
 type Celeritas struct {
-	AppName  string
-	Debug    bool
-	Version  string
-	ErrorLog *log.Logger
-	InfoLog  *log.Logger
-	RootPath string
-	Routes   *chi.Mux
-	Render   *render.Render
-	Session  *scs.SessionManager
-	DB       Database
-	JetViews *jet.Set
-	config   config
+	AppName       string
+	Debug         bool
+	Version       string
+	ErrorLog      *log.Logger
+	InfoLog       *log.Logger
+	RootPath      string
+	Routes        *chi.Mux
+	Render        *render.Render
+	Session       *scs.SessionManager
+	DB            Database
+	JetViews      *jet.Set
+	config        config
+	EncryptionKey string
+	Cache         cache.Cache
+	Scheduler     *cron.Cron
+	Mail          mailer.Mail
+	Server        Server
+}
+
+type Server struct {
+	ServerName string
+	Port       string
+	Secure     bool
+	URL        string
 }
 
 type config struct {
@@ -41,6 +64,7 @@ type config struct {
 	cookie      cookieConfig
 	sessionType string
 	database    databaseConfig
+	redis       redisConfig
 }
 
 // New reads the .env file, creates our application config, populates the Celeritas type with settings
@@ -48,7 +72,7 @@ type config struct {
 func (c *Celeritas) New(rootPath string) error {
 	pathConfig := initPaths{
 		rootPath:    rootPath,
-		folderNames: []string{"handlers", "migrations", "views", "data", "public", "tmp", "logs", "middleware"},
+		folderNames: []string{"handlers", "migrations", "views", "mail", "data", "public", "tmp", "logs", "middleware"},
 	}
 
 	err := c.Init(pathConfig)
@@ -83,11 +107,34 @@ func (c *Celeritas) New(rootPath string) error {
 		}
 	}
 
+	scheduler := cron.New()
+	c.Scheduler = scheduler
+
+	if os.Getenv("CACHE") == "redis" || os.Getenv("SESSION_TYPE") == "redis" {
+		myRedisCache = c.createClientRedisCache()
+		c.Cache = myRedisCache
+		redisPool = myRedisCache.Conn
+	}
+
+	if os.Getenv("CACHE") == "badger" {
+		myBadgerCache = c.createClientBadgerCache()
+		c.Cache = myBadgerCache
+		badgerConn = myBadgerCache.Conn
+
+		_, err = c.Scheduler.AddFunc("@daily", func() {
+			_ = myBadgerCache.Conn.RunValueLogGC(0.7)
+		})
+		if err != nil {
+			return err
+		}
+	}
+
 	c.InfoLog = infoLog
 	c.ErrorLog = errorLog
 	c.Debug, _ = strconv.ParseBool(os.Getenv("DEBUG"))
 	c.Version = version
 	c.RootPath = rootPath
+	c.Mail = c.createMailer()
 	c.Routes = c.routes().(*chi.Mux)
 
 	c.config = config{
@@ -105,6 +152,23 @@ func (c *Celeritas) New(rootPath string) error {
 			database: os.Getenv("DATABASE_TYPE"),
 			dsn:      c.BuildDSN(),
 		},
+		redis: redisConfig{
+			host:     os.Getenv("REDIS_HOST"),
+			password: os.Getenv("REDIS_PASSWORD"),
+			prefix:   os.Getenv("REDIS_PREFIX"),
+		},
+	}
+
+	secure := true
+	if strings.ToLower(os.Getenv("SECURE")) == "false" {
+		secure = false
+	}
+
+	c.Server = Server{
+		ServerName: os.Getenv("SERVER_NAME"),
+		Port:       os.Getenv("PORT"),
+		Secure:     secure,
+		URL:        os.Getenv("APP_URL"),
 	}
 
 	// create session
@@ -117,16 +181,31 @@ func (c *Celeritas) New(rootPath string) error {
 		CookieDomain:   c.config.cookie.domain,
 	}
 
+	switch c.config.sessionType {
+	case "redis":
+		sess.RedisPool = myRedisCache.Conn
+	case "mysql", "postgres", "mariadb", "postgresql":
+		sess.DBPool = c.DB.Pool
+	}
+
 	c.Session = sess.InitSession()
+	c.EncryptionKey = os.Getenv("KEY")
 
-	var views = jet.NewSet(
-		jet.NewOSFileSystemLoader(fmt.Sprintf("%s/views", rootPath)),
-		jet.InDevelopmentMode(),
-	)
-
-	c.JetViews = views
+	if c.Debug {
+		var views = jet.NewSet(
+			jet.NewOSFileSystemLoader(fmt.Sprintf("%s/views", rootPath)),
+			jet.InDevelopmentMode(),
+		)
+		c.JetViews = views
+	} else {
+		var views = jet.NewSet(
+			jet.NewOSFileSystemLoader(fmt.Sprintf("%s/views", rootPath)),
+		)
+		c.JetViews = views
+	}
 
 	c.createRenderer()
+	go c.Mail.ListenForMail()
 
 	return nil
 }
@@ -155,7 +234,17 @@ func (c *Celeritas) ListenAndServe() {
 		WriteTimeout: 600 * time.Second,
 	}
 
-	defer c.DB.Pool.Close()
+	if c.DB.Pool != nil {
+		defer c.DB.Pool.Close()
+	}
+
+	if redisPool != nil {
+		defer redisPool.Close()
+	}
+
+	if badgerConn != nil {
+		defer badgerConn.Close()
+	}
 
 	c.InfoLog.Printf("Listening on port %s", os.Getenv("PORT"))
 	err := srv.ListenAndServe()
@@ -189,6 +278,68 @@ func (c *Celeritas) createRenderer() {
 		Session:  c.Session,
 	}
 	c.Render = &myRenderer
+}
+
+func (c *Celeritas) createMailer() mailer.Mail {
+	port, _ := strconv.Atoi(os.Getenv("SMTP_PORT"))
+	m := mailer.Mail{
+		Domain:      os.Getenv("MAIL_DOMAIN"),
+		Templates:   c.RootPath + "/mail",
+		Host:        os.Getenv("SMTP_HOST"),
+		Port:        port,
+		Username:    os.Getenv("SMTP_USERNAME"),
+		Password:    os.Getenv("SMTP_PASSWORD"),
+		Encryption:  os.Getenv("SMTP_ENCRYPTION"),
+		FromName:    os.Getenv("FROM_NAME"),
+		FromAddress: os.Getenv("FROM_ADDRESS"),
+		Jobs:        make(chan mailer.Message, 20),
+		Results:     make(chan mailer.Result, 20),
+		API:         os.Getenv("MAILER_API"),
+		APIKey:      os.Getenv("MAILER_KEY"),
+		APIUrl:      os.Getenv("MAILER_URL"),
+	}
+	return m
+}
+
+func (c *Celeritas) createClientRedisCache() *cache.RedisCache {
+	cacheClient := cache.RedisCache{
+		Conn:   c.createRedisPool(),
+		Prefix: c.config.redis.prefix,
+	}
+	return &cacheClient
+}
+
+func (c *Celeritas) createClientBadgerCache() *cache.BadgerCache {
+	cacheClient := cache.BadgerCache{
+		Conn: c.createBadgerConn(),
+	}
+	return &cacheClient
+}
+
+func (c *Celeritas) createRedisPool() *redis.Pool {
+	return &redis.Pool{
+		MaxIdle:     50,
+		MaxActive:   10000,
+		IdleTimeout: 240 * time.Second,
+		Dial: func() (redis.Conn, error) {
+			return redis.Dial("tcp",
+				c.config.redis.host,
+				redis.DialPassword(c.config.redis.password))
+		},
+
+		TestOnBorrow: func(conn redis.Conn, t time.Time) error {
+			_, err := conn.Do("PING")
+			return err
+		},
+	}
+}
+
+func (c *Celeritas) createBadgerConn() *badger.DB {
+	db, err := badger.Open(badger.DefaultOptions(c.RootPath + "/tmp/badger"))
+	if err != nil {
+		return nil
+	}
+	return db
 }
 
 // BuildDSN builds the datasource name for our database, and returns it as a string
